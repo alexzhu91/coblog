@@ -1,0 +1,930 @@
+/* ********************************************************************************* */
+/* ************** W R D S   R E S E A R C H   A P P L I C A T I O N S ************** */
+/* ********************************************************************************* */
+/* Program   : ps.sas                                                                */
+/* Summary   : Calculate alphas for liquidity-decile portfolios                      */
+/*             based on the Pastor and Stambaugh (JPE, 2003) methodology.            */
+/* Date      : April 2011.                                                           */
+/* Author    : Premal P. Vora                                                        */
+/*                                                                                   */
+/* Details   : Program assigns, in year t, each common stock to a liquidity decile   */
+/*             based on decile breakpoints in year t-1. Calculates liquidity-decile  */
+/*             portfolio returns and CAPM alpha, Fama-French three-factor alpha,     */
+/*             and Fama-French + momentum factor alphas for each portfolio.          */ 
+/*                                                                                   */
+/*                                                                                   */
+/* To run the program, a user should have access to CRSP daily and monthly stock     */
+/* data.                                                                             */
+/* ********************************************************************************* */
+
+options ls=90 ps=max nocenter nodate nonumber fullstimer macrogen mprint symbolgen spool  ;
+
+/*--------------------------------------------------------------------*/
+/*      Retrieve the CRSP Monthly Events data keeping only            */
+/*      PERMNO, exchange code, share code, and date.                  */
+/*                                                                    */
+/*      Keep only ordinary common stock (no ADRs, etc.),              */
+/*      keep only those records that have non-missing values          */
+/*      for exchange code, and drop the share code as it's no         */
+/*      longer needed...                                              */
+/*--------------------------------------------------------------------*/
+data mseall; set crsp.mseall (keep = permno date exchcd shrcd) ;
+  where (shrcd = 10 OR shrcd = 11) AND exchcd ~= . ;
+
+  YYYY = year(date);
+  MM = month(date);
+
+  label YYYY = 'Year of observation'
+  label MM = 'Month of observation';
+
+  drop shrcd date;
+run;
+
+
+proc sort data = mseall;
+ by permno yyyy mm;
+run;
+
+data mseall; set mseall;
+ by permno yyyy;
+ if last.yyyy ;
+ if exchcd  = 3 OR exchcd =33 then delete;
+
+ yyyy = yyyy + 1;
+run;
+
+
+/*-----------------------------------------------*/
+/*   Creates a list of unique permnos that can   */
+/*   be used to retrieve the monthly data...     */
+/*-----------------------------------------------*/
+proc sort data = crsp.mseall out = perms  nodupkey;
+ by permno;
+run;
+
+
+/*____________________________________________________________________*/
+/*   Retrieve monthly returns for each PERMNO (only to identify in    */
+/*   which month the PERMNO's data begins), mark the data to          */
+/*   indicate the first and last months of data, then retrieve the    */
+/*   daily data.                                                      */
+/*____________________________________________________________________*/
+proc sql;
+  create table msfscaling as
+  select msf.permno, msf.date, year(msf.date) as YYYY, month(msf.date) as MM, 
+         abs(msf.prc) as prc, msf.shrout, abs(msf.prc)*msf.shrout as mktcapt_1
+  from work.perms, crsp.msf
+  where msf.permno = perms.permno ;
+quit;
+
+
+data msfscaling (drop = yyyy mm prc shrout); set msfscaling;
+ if mm = 12 then
+    do;
+      match_mm = 1;
+      match_yyyy = yyyy + 1;
+    end;
+ else 
+    do;
+      match_mm = mm + 1;
+      match_yyyy = yyyy;
+    end;
+run;
+
+proc sort data = msfscaling;
+ by permno match_yyyy match_mm;
+run;
+
+
+data dsi; set crsp.dsi (keep = date vwretd);
+  if not missing(vwretd);
+  yyyy = year(date);
+    mm = month(date);
+    dd = day(date);
+run;
+
+
+/*____________________________________________________________________*/
+/*   Retrieve monthly returns for each PERMNO (only to identify in    */
+/*   which month the PERMNO's data begins), mark the data to          */
+/*   indicate the first and last months of data, then retrieve the    */
+/*   daily data.                                                      */
+/*____________________________________________________________________*/
+proc sql;
+  create table msf_a as
+  select msf.permno, msf.date, year(msf.date) as YYYY, month(msf.date) as MM, 
+         abs(msf.prc) as prc, msf.shrout, 
+         min(msf.ret,9999.99) as ret_marker label = 'Marker for first months return'
+  from work.perms, crsp.msf
+  where msf.permno = perms.permno ;
+
+  create table lj as
+  select dsi.*, msf_a.permno, msf_a.ret_marker
+  from work.dsi left join work.msf_a
+  on dsi.yyyy = msf_a.yyyy and dsi.mm = msf_a.mm;
+
+  create table dsf as
+  select lj.*, dsf.prc, dsf.ret, dsf.shrout, dsf.cfacpr, dsf.cfacshr, dsf.vol 
+  from work.lj left join crsp.dsf
+  on lj.permno = dsf.permno and lj.date = dsf.date ;
+quit;
+
+
+/*-----------------------------------------------*/
+/*   Confine the daily data to only those years  */
+/*   where the exchange code at the end of the   */
+/*   previous year was not 3 nor 33 (footnote    */
+/*   5, p. 646, Pastor and Stambaugh).           */
+/*-----------------------------------------------*/
+proc sql;
+  create table dsf1 as 
+  select dsf.*
+  from work.dsf, work.mseall
+  where mseall.permno = dsf.permno AND mseall.yyyy  = dsf.yyyy;
+quit;
+
+proc sort data = dsf1;
+ by permno yyyy mm dd;
+run;
+
+
+/*-----------------------------------------------*/
+/*   Increment the month before merging          */
+/*   pme_prc into the daily data. This will      */
+/*   merge the previous month end price into     */
+/*   the daily data so that if it's < 5.00 or    */
+/*   > 1000.00 it can be eliminated.             */
+/*-----------------------------------------------*/
+data msf; set msf_a (keep = permno yyyy mm prc);
+ rename prc = pme_prc; 
+
+ if mm = 12 then
+   do;
+     mm = 1;
+     yyyy = yyyy + 1;
+   end;
+ else mm = mm + 1;
+run;
+
+
+proc sort data = msf;
+ by permno yyyy mm;
+run;
+
+
+/*--------------------------------------------------------------------*/
+/*    Merge the events data with the returns data by YYYY MM.         */
+/*    After merging, sort the data by PERMNO, YYYY, MM so that the    */
+/*    exchange code can be propogated forward.                        */
+/*--------------------------------------------------------------------*/
+data dsf (sortedby = permno yyyy mm dd) 
+     monthly_list (keep = date yyyy mm permno monthly_data_counter   sortedby = permno yyyy mm);
+
+
+  merge dsf1 msf;
+  by permno yyyy mm;
+
+  retain monthly_data_counter;
+
+
+  if (yyyy >= 1963 AND yyyy <= 1999) OR (yyyy = 1962 and mm > 5) then;    /*-- Keep June 1962 on data for --*/
+  else mark_for_delete = 1;                                               /*-- calculations done later    --*/
+
+
+/*-----------------------------------------------*/
+/*   On the first day of every month determine   */
+/*   whether this month-year is screened in or   */
+/*   out due to the price filter and initialize  */
+/*   the count of valid monthly data.            */
+/*-----------------------------------------------*/
+  if first.mm then monthly_data_counter = 0;
+
+  RE = ret - vwretd;
+ SRE = sign(re);
+ LRE = lag(re);
+LSRE = lag(sre);
+LRET = lag(ret);
+
+   if mm = lag(mm) then;
+   else
+     do;
+         lre = . ;
+        lret = . ;
+        lsre = . ;
+     end;
+
+  
+ 
+   prc = abs(prc);
+   vol = abs(vol);
+   DV = (prc*vol)/1000000;
+  LDV = lag(dv) ;
+ RHS2 = LSRE * LDV;
+   TSO=shrout*1000; 
+   MKTCAP = prc*shrout*1000/1000000;
+
+  label  dv = 'Dollar Volume'
+      ldv = 'Lag(Dollar Volume)'
+      tso = 'Total Shares Outstanding'
+       re = 'Excess Return = Firm Return - Market Return' 
+      sre = 'Sign of Excess Return' 
+      lre = 'Lag Excess Return'
+     lret = 'Lag(Return)'
+     lsre = 'Lag(Sign(Excess Return))'
+     rhs2 = 'Second rhs term in the Pastor - Stambaugh regression'
+   mktcap = 'Market Capitalization' ;
+
+
+
+  if not missing(ret) AND not missing(vol) AND mark_for_delete < 1 AND ldv ~= 0.00 AND not missing(lsre) then 
+        monthly_data_counter = monthly_data_counter + 1 ;
+  else mark_for_delete = 2;
+
+
+  if last.mm then
+    do;
+      if monthly_data_counter >= 15 then output monthly_list;  
+    end;
+
+
+  if ret_marker < 9999 then;  /* Takes care of dropping the first and last partial month of data */
+  else mark_for_delete = 3;
+
+  if pme_prc < 5.00 or pme_prc > 1000.00 then mark_for_delete = 4;  /*  Price screen for previous month end  */
+  
+  if mark_for_delete < 1 then output dsf;
+run;
+
+
+/*____________________________________________________________________*/
+/*  Get the relevant daily returns, sort them, run the regressions    */
+/*  and save the regression parameters.                               */
+/*____________________________________________________________________*/
+proc sql;
+ create table dat as
+ select dsf.permno, dsf.yyyy, dsf.mm, dsf.dd, dsf.re, dsf.lret,
+        dsf.rhs2, dsf.mktcap, dsf.date
+ from dsf, monthly_list
+ where dsf.permno = monthly_list.permno and dsf.yyyy = monthly_list.yyyy and
+       dsf.mm = monthly_list.mm;
+quit;
+
+
+proc reg data = dat outest = est edf noprint  ;
+ model re = lret rhs2 ;
+ by permno yyyy mm;
+run;
+
+/*____________________________________________________________________*/
+/*       Equations (6), (7), and (8)                                  */
+/*       Calculates a rolling L(t)                                    */
+/*____________________________________________________________________*/
+data lt; set est;
+ by permno yyyy mm;
+
+ dgamma = rhs2 - lag(rhs2);
+
+ if permno = lag(permno) then;
+ else dgamma = .;
+
+run;
+
+
+proc sort data = lt ;
+ by yyyy mm;
+run;
+
+proc univariate noprint data = lt;
+ var dgamma;
+ by yyyy mm;
+ output out = mdg  mean = MEANDGAMMA n = N;
+run;
+
+/*-----------------------------------------------*/
+/*   Make a list of PERMNOs that are in the      */
+/*   gamma sample.                               */
+/*-----------------------------------------------*/
+proc sort data = dat out = newdat (keep = permno yyyy mm) nodupkey;
+ by permno yyyy mm;
+run;
+
+
+/*-----------------------------------------------*/
+/*   Now use the above list of PERMNOs and yyyy- */
+/*   mm to get the maximum possible coverage     */
+/*   for the market capitalization.              */
+/*-----------------------------------------------*/
+proc sql;
+ create table mc as
+ select msfs.mktcapt_1, newdat.permno, newdat.yyyy, newdat.mm
+ from work.msfscaling as msfs, work.newdat
+ where msfs.permno = newdat.permno and msfs.match_yyyy = newdat.yyyy and msfs.match_mm = newdat.mm;
+quit;
+
+
+proc sort data = mc;
+ by yyyy mm;
+run;
+
+
+/*-----------------------------------------------*/
+/*   Get end of month dates from the msi file    */
+/*   to merge them into the data so that each    */
+/*   data point has a date associated with it.   */
+/*-----------------------------------------------*/
+data msi (sortedby = yyyy mm); set crsp.msi (keep = date);
+ yyyy = year(date);
+   mm = month(date);
+run;
+
+data mc (sortedby = yyyy mm); merge mc msi;
+ by yyyy mm;
+ if 1962 <= yyyy <= 1999;
+ if yyyy = 1962 then
+   do;
+     if mm >= 6;
+   end;
+run;
+
+
+proc univariate data = mc noprint;
+ var mktcapt_1;
+ by yyyy mm;
+ output out = m 
+        sum = MT
+        n = N;
+run;
+
+
+data m (keep = yyyy mm scaling_factor_t scaling_factor_t_1   sortedby = yyyy mm); set m;
+ retain m1;
+ 
+ if 2000 > yyyy > 1962 or (yyyy = 1962 and mm > 7);
+ if yyyy = 1962 and mm = 8 then m1 = mt;
+
+ scaling_factor_t = mt / m1;
+ scaling_factor_t_1 = lag(scaling_factor_t) ;
+run;
+
+
+
+data dyhat (sortedby = yyyy mm); merge m msi mdg (keep = meandgamma yyyy mm);
+ by yyyy mm;
+
+ Y = meandgamma  * scaling_factor_t;
+ if not missing(y);
+run;
+
+
+data lt (keep = yyyy mm y x1 x2  sortedby = yyyy mm); set dyhat;
+ by yyyy;
+
+ X1 = lag(y);
+ X2 = scaling_factor_t_1 * x1 ;
+
+ if not missing(y) AND not missing(x1) AND not missing(x2);
+run;
+
+
+/*____________________________________________________________________*/
+/*         Calculate monthly innovations in liquidity that are        */
+/*         recalculated every year                                    */
+/*____________________________________________________________________*/
+data newlt (keep = yyyy mm lt) ; set lt;
+ by yyyy;
+ retain a b c e f i j k l;
+
+/*-----------------------------------------------*/
+/*   Set the values of the variables that will   */
+/*   hold all the regression numbers to 0.0      */
+/*   to initialize these numbers                 */
+/*-----------------------------------------------*/
+/*   Create the hash table that will contain     */
+/*   the y, x1, and x2 values for every year     */
+/*-----------------------------------------------*/
+ if _n_ = 1 then 
+   do;
+      a = 0.0 ;
+      b = 0.0 ;
+      c = 0.0 ;
+
+      e = 0.0 ;
+      f = 0.0 ;
+
+      i = 0.0 ;
+      j = 0.0 ;
+      k = 0.0 ;
+      l = 0.0 ;
+
+
+      declare hash yx1x2 (ordered: 'a');
+      declare hiter yx1x2_iter ('yx1x2');
+      yx1x2.definekey('yyyy', 'mm');
+      yx1x2.definedata('yyyy', 'mm', 'y', 'x1', 'x2');
+      yx1x2.definedone();
+   end;
+
+
+  yx1x2.add();   /*--  Add the observation to the hash table  --*/
+
+/*-----------------------------------------------*/
+/*   These are the calculations for estimating   */
+/*   the regression parameters.                  */
+/*-----------------------------------------------*/
+ a = a + 1;
+ b = b + x1;
+ c = c + x2;
+ e = e + x1**2;
+ f = f + x1 * x2 ;
+ i = i + x2**2 ;
+ j = j + y;
+ k = k + x1 * y;
+ l = l + x2 * y;
+
+
+ if last.yyyy then 
+    do;
+       if yyyy = 1962 then;        /*-- Don't do anything if end of year 1962 (not enough data) --*/
+       else
+            do;
+                det = (2*b*c*f - e*c*c - a*f*f - i*b*b + a*e*i)   ;
+          
+                b0 = ( ((e*i - f*f)*j) + ((c*f - b*i)*k)  + ((b*f - c*e)*l) ) / det ;
+                b1 = ((c*f - b*i)*j  +  (a*i - c*c)*k  +  (b*c - a*f)*l) / det;
+                b2 = ((b*f - c*e)*j  +  (b*c - a*f)*k  +  (a*e - b*b)*l) / det;
+
+                do end_of_hash =  yx1x2_iter.first() by 0 while (end_of_hash = 0);
+                  Lt = (y - (b0 + b1*x1 + b2*x2))  ;
+                  label lt = 'Innovation in Liquidity or Pastor-Stambaugh Lt';
+                  output;
+                  end_of_hash =  yx1x2_iter.next();
+                end;
+   
+                yx1x2.clear();  /*-- clear the hash table --*/
+            end;
+    end;
+
+run;
+
+
+
+/*____________________________________________________________________*/
+/*             Calculate the liquidity beta of every PERMNO that      */
+/*             has 60 observations in every 5-year period.            */
+/*____________________________________________________________________*/
+
+/*-----------------------------------------------*/
+/*   Retrieve the monthly trading days from the  */
+/*   msi file and create 60-month overlapping    */
+/*   windows on the data.                        */
+/*-----------------------------------------------*/
+data msi (drop = i); set crsp.msi (keep = date vwretd);
+ yyyy = year(date);
+   mm = month(date);
+
+ if 1963 <= yyyy <= 1999;
+
+ do i = 0 to 4;
+   regy = yyyy + i;
+   label regy = "Grouping variable for running liquidity regression";
+   if regy >= 1967 then output;
+ end;
+run;
+
+
+
+/*-----------------------------------------------*/
+/*   Retrieve the Fama-French and momentum       */
+/*   factors and merge them into the             */
+/*   rolling windows (none of the factors data   */
+/*   is missing -- checked).                     */
+/*-----------------------------------------------*/
+data fm; set ff.factors_monthly (drop = date dateff rename = (year=yyyy month=mm));
+ if  1963 <= yyyy <= 1999;
+run;
+
+proc sort data = fm ;
+ by yyyy mm;
+run;
+
+
+proc sql;
+ create table fm1 as 
+ select fm.*, msi.*
+ from work.fm, work.msi
+ where fm.yyyy = msi.yyyy and fm.mm = msi.mm;
+quit;
+
+
+
+/*-----------------------------------------------*/
+/*   Retrieve the Pastor - Stambaugh marketwide  */
+/*   Lt factor that is used for calculating      */
+/*   individual firms' liquidity betas           */
+/*-----------------------------------------------*/
+data newlt; set newlt;
+ if  1963 <= yyyy <= 1999;
+run;
+
+
+proc sql;
+  create table factors as
+  select fm1.*, newlt.lt
+  from work.fm1, work.newlt
+  where fm1.yyyy = newlt.yyyy and fm1.mm = newlt.mm;
+quit;
+
+
+/*-----------------------------------------------*/
+/*   Retrieve firm monthly returns and merge     */
+/*   returns into the factors data to prepare    */
+/*   the data for calculation of liquidity       */
+/*   betas.                                      */
+/*-----------------------------------------------*/
+/*--------------------------------------------------------------------*/
+/*      Retrieve the CRSP Monthly Events data keeping only            */
+/*      PERMNO, exchange code, share code, and date.                  */
+/*                                                                    */
+/*      Keep only ordinary common stock (no ADRs, etc.),              */
+/*      keep only those records that have non-missing values          */
+/*      for exchange code, and drop the share code as it's no         */
+/*      longer needed...                                              */
+/*--------------------------------------------------------------------*/
+data mseall; set crsp.mseall (keep = permno shrcd) ;
+  where (shrcd = 10 OR shrcd = 11)  ;
+
+  drop shrcd;
+run;
+
+proc sort data = mseall out = perms  nodupkey;
+ by permno;
+run;
+
+
+proc sql;
+ create table msf as
+ select msf.date, year(msf.date) as yyyy, month(msf.date) as mm, msf.ret, msf.permno, abs(msf.prc) as prc
+ from crsp.msf, work.perms
+ where msf.permno = perms.permno;
+
+ create table msf1 as
+ select msf.*
+ from work.msf
+ where 1963 <= yyyy <= 1999  ;
+quit;
+
+proc sql;
+ create table reg as
+ select factors.*, msf1.permno, msf1.ret, (msf1.ret - factors.rf) as excessret 
+ from work.factors, work.msf1
+ where factors.yyyy = msf1.yyyy and factors.mm = msf1.mm;
+
+ create table reg1 as
+ select reg.*
+ from work.reg
+ where not missing(excessret) and not missing(lt)
+ group by permno, regy
+ having count(*) = 60;
+quit;
+
+
+proc sort data = reg1;
+ by permno regy ;
+run;
+
+
+proc reg data = reg1 outest = betalt noprint;
+ model excessret = mktrf hml smb umd Lt;
+ by permno regy;
+run;
+
+
+/*____________________________________________________________________*/
+/*            calculate and merge in the portfolio boundaries         */
+/*____________________________________________________________________*/
+proc sort data = betalt ;
+ by regy;
+run;
+
+
+proc univariate data = betalt noprint;
+ var lt;
+ by regy;
+ output out = boundaries pctlpts = 10 to 90 by 10  pctlpre = ltb_  ;
+run;
+
+
+/*-----------------------------------------------*/
+/*   Increment regy because the y-1 boundaries   */
+/*   are used to classify the y data into        */
+/*   portfolios.
+/*-----------------------------------------------*/
+/*   This particular DATA step should never      */
+/*   be run in isolation because it will         */
+/*   increment regy in the data set that is      */
+/*   read in. If this DATA step needs to be      */
+/*   rerun for any reason, run this whole macro  */
+/*   over again.                                 */
+/*-----------------------------------------------*/
+data boundaries; set boundaries;
+ regy = regy + 1;
+run;
+
+
+data port (drop = ltb_10 ltb_20 ltb_30 ltb_40 ltb_50
+                       ltb_60 ltb_70 ltb_80 ltb_90 rename = (regy = yyyy)); 
+ merge boundaries betalt;
+
+ by regy;
+
+ if regy = 1967 OR regy = 2000 then delete;
+
+ select;
+   when (lt <= ltb_10)  DECILE = 1;
+   when (ltb_10 < lt <= ltb_20) DECILE = 2;
+   when (ltb_20 < lt <= ltb_30) DECILE =  3  ;
+   when (ltb_30 < lt <= ltb_40) DECILE = 4  ;
+   when (ltb_40 < lt <= ltb_50) DECILE =  5 ;
+   when (ltb_50 < lt <= ltb_60) DECILE =  6 ;
+   when (ltb_60 < lt <= ltb_70) DECILE =  7 ;
+   when (ltb_70 < lt <= ltb_80) DECILE =  8 ;
+   when (ltb_80 < lt <= ltb_90) DECILE =  9 ;
+   otherwise DECILE = 10 ;
+ end;
+
+ label decile = 'Liquidity Decile for PERMNO-YYYY';
+run;
+
+
+/*____________________________________________________________________*/
+/*                                                                    */
+/*            calculate the decile returns                            */
+/*____________________________________________________________________*/
+proc sort data = port out = port_a (keep = permno) nodupkey;
+ by permno;
+run;
+
+proc sort data = port out = port1 (keep = permno yyyy decile) nodupkey;
+ by permno yyyy;
+run;
+
+
+proc sql;
+/*-----------------------------------------------*/
+/*   First retrieve the monthly return and       */
+/*   price data for only those firms that        */
+/*   appear in the port dataset                  */
+/*-----------------------------------------------*/
+ create table msf as 
+ select msf.permno, msf.ret, abs(msf.prc) as prc, year(msf.date) as yyyy, month(msf.date) as mm,
+        abs(msf.prc * msf.shrout) as MKTCAP
+ from crsp.msf, work.port_a
+ where msf.permno = port_a.permno;
+
+/*-----------------------------------------------*/
+/*   Now cull the data so that it's kept only    */
+/*   for those years that appear in the port     */
+/*   data set.                                   */
+/*-----------------------------------------------*/
+ create table msf1 as
+ select msf.*, port1.decile 
+ from work.msf, work.port1
+ where msf.permno = port1.permno and msf.yyyy = port1.yyyy;
+quit;
+
+
+
+data mktcap_1; set msf1 (keep = permno yyyy mm mktcap  rename = (mktcap = mktcap_1));
+ if mm = 12 then
+  do;
+     mm = 1;
+     yyyy = yyyy + 1;
+  end;
+ else mm = mm + 1;
+run;
+
+
+proc sort data = mktcap_1; 
+ by yyyy mm;
+run;
+
+proc univariate data = mktcap_1 noprint;
+ var mktcap_1;
+ by yyyy mm;
+ output out = tmc sum = tmc;
+run;
+
+
+data weights; merge tmc mktcap_1;
+ by yyyy mm;
+
+ wi = mktcap_1 / tmc;
+run;
+
+proc sort data = msf1;
+ by permno yyyy mm;
+run;
+
+proc sort data = weights;
+ by permno yyyy mm;
+run;
+
+data rets; merge msf1 (keep = permno yyyy mm decile ret)
+                 weights (keep = permno yyyy mm wi);
+ by permno yyyy mm;
+run;
+
+
+proc sort data = rets;
+ by yyyy mm decile;
+run;
+
+
+proc univariate noprint data = rets;
+ var ret;
+ by yyyy mm decile;
+ weight wi;
+ output out = portrets1 mean = VWDECILERET n = N;
+run;
+
+data portrets1; set portrets1;
+ if n > 0.0;
+run;
+
+
+proc univariate noprint data = rets;
+ var ret;
+ by yyyy mm decile;
+ output out = portrets2 mean = EWDECILERET n = N;
+run;
+
+data portrets2; set portrets2;
+ if n > 0.0;
+run;
+
+proc sort data = portrets1;
+ by yyyy mm decile;
+run;
+
+proc sort data = portrets2;
+ by yyyy mm decile;
+run;
+
+data portrets; merge portrets1 portrets2;
+ by yyyy mm decile;
+run;
+
+
+/*____________________________________________________________________*/
+/*              Calculate the alphas on the decile portfolios         */
+/*____________________________________________________________________*/
+data fm; set ff.factors_monthly (drop = date dateff rename = (year=yyyy month=mm));
+ if  1963 <= yyyy <= 1999;
+run;
+
+proc sort data = fm ;
+ by yyyy mm;
+run;
+
+
+proc sort data = portrets;
+ by yyyy mm;
+run;
+
+data alphadata; merge portrets fm;
+ by yyyy mm;
+
+ VWDECXSRET = vwdecileret - rf;
+ EWDECXSRET = ewdecileret - rf;
+
+ label vwdecxsret = 'Value-weighted Decile Return - Rf'
+       ewdecxsret = 'Equally-weighted Decile Return - Rf';
+run;
+
+
+proc sort data = alphadata ;
+ by decile;
+run;
+
+
+proc reg data = alphadata noprint  outseb  outest = vcapm;
+ model vwdecxsret = mktrf ;
+ by decile;
+run;
+
+proc sort data = vcapm  out = vcapm (drop = _model_ _rmse_ _model_); 
+ by decile  descending _type_ ;
+run;
+
+data x (drop = _depvar_ _type_ stderr vwdecxsret mktrf   rename = (intercept = alpha) ); set vcapm;
+ stderr = lag(Intercept);
+
+ if _type_ = 'PARMS' then
+    do;
+      t = Intercept / stderr;
+      Intercept = Intercept * 12.0 ;  /* monthly becomes annual */
+      output;
+    end;
+
+ format intercept percent8.2;
+ format t 8.2;
+run;
+
+title "Alpha from (VWPORTRET - Rf) = alpha + beta*(MKT RET - Rf) + e ";
+proc print noobs data = x;
+ var decile alpha t;
+run;
+
+
+proc reg data = alphadata noprint  outseb   outest = v3f;
+ model vwdecxsret = mktrf smb hml;
+ by decile;
+run;
+
+proc sort data = v3f  out = v3f (drop = _model_ _rmse_ _model_); 
+ by decile  descending _type_ ;
+run;
+
+
+data x (drop = _depvar_ _type_ stderr vwdecxsret mktrf smb hml  rename = (intercept = alpha) ); set v3f;
+ stderr = lag(Intercept);
+
+ if _type_ = 'PARMS' then
+    do;
+      t = Intercept / stderr;
+      Intercept = Intercept * 12.0 ;  /* monthly becomes annual */
+      output;
+    end;
+ format intercept percent8.2;
+ format t 8.2;
+run;
+
+
+title "Alpha from (VWPORTRET - Rf) = alpha + b0*(MKT RET - Rf) + b1*SMB + b2*HML + e ";
+proc print noobs data = x;
+ var decile alpha t;
+run;
+
+
+proc reg data = alphadata noprint  outseb   outest = v4f;
+ model vwdecxsret = mktrf smb hml umd;
+ by decile;
+run;
+
+proc sort data = v4f  out = v4f (drop = _model_ _rmse_ _model_); 
+ by decile  descending _type_ ;
+run;
+
+data x (drop = _depvar_ _type_ stderr vwdecxsret mktrf smb hml umd  rename = (intercept = alpha) ); set v4f;
+ stderr = lag(Intercept);
+
+ if _type_ = 'PARMS' then
+    do;
+      t = Intercept / stderr;
+      Intercept = Intercept * 12.0 ;  /* monthly becomes annual */
+      output;
+    end;
+ format intercept percent8.2;
+ format t 8.2;
+run;
+
+
+title "Alpha from (VWPORTRET - Rf) = alpha + b0*(MKT RET - Rf) + b1*SMB + b2*HML + b3*MOM + e ";
+proc print noobs data = x;
+ var decile alpha t;
+run;
+
+
+proc reg data = alphadata noprint  outseb   outest = e4f;
+ model ewdecxsret = mktrf smb hml umd;
+ by decile;
+run;
+
+proc sort data = e4f  out = e4f (drop = _model_ _rmse_ _model_); 
+ by decile  descending _type_ ;
+run;
+
+
+data x (drop = _depvar_ _type_ stderr ewdecxsret mktrf smb hml umd  rename = (intercept = alpha) ); set e4f;
+ stderr = lag(Intercept);
+
+ if _type_ = 'PARMS' then
+    do;
+      t = Intercept / stderr;
+      Intercept = Intercept * 12.0 ;  /* monthly becomes annual */
+      output;
+    end;
+ format intercept percent8.2;
+ format t 8.2;
+run;
+
+
+title "Alpha from (EWPORTRET - Rf) = alpha + b0*(MKT RET - Rf) + b1*SMB + b2*HML + b3*MOM + e ";
+proc print noobs data = x;
+ var decile alpha t;
+run;
+
+/* ********************************************************************************* */
+/* *************  Material Copyright Wharton Research Data Services  *************** */
+/* ****************************** All Rights Reserved ****************************** */
+/* ********************************************************************************* */

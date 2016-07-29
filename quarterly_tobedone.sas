@@ -1,0 +1,10 @@
+*derive week return to calc qtrly efficiency measure;
+proc expand data=weekrtn out=week from=week to=week method = none;
+  by stkcd;
+  id week;
+convert mktret = mktret;
+convert weekret = weekret;
+  convert mktret = mkt_lag1   / transformout=(lag 1);
+  convert mktret = mkt_lag2   / transformout=(lag 2);
+  convert mktret = mkt_lag3   / transformout=(lag 3);
+run;
