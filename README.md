@@ -8,5 +8,7 @@ Dist_stk is not well represented either, since the actual stks is unknown.But fo
 
 Detrend can't decompose the co-attention, since attention always induce co-attention. the ratio co_p_r may do.
 
+Volume detrend as in Barber 2008, but only test for weekly data
+
 
 
